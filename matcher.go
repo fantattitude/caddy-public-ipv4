@@ -2,13 +2,10 @@
 package publicipv4
 
 import (
-	"context"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/netip"
-	"strings"
 	"sync"
 	"time"
 
@@ -64,8 +61,8 @@ func (Matcher) MatchWithError(r *http.Request) (bool, error) {
 	return observed.IsValid() && observed == ip, nil
 }
 
-// A request never waits for the external services. One shared cache is used by
-// all matcher instances; failed refreshes retain an address only until expiry.
+// A request never waits for the router. One shared cache is used by
+// all matcher instances; a failed refresh clears the trusted address.
 type addressCache struct {
 	mu         sync.Mutex
 	address    netip.Addr
@@ -97,53 +94,14 @@ func (c *addressCache) refresh() {
 	c.refreshing = false
 	now := time.Now()
 	if err != nil {
+		c.address = netip.Addr{}
+		c.expires = time.Time{}
 		c.next = now.Add(time.Minute)
 		return
 	}
 	c.address = ip
 	c.expires = now.Add(10 * time.Minute)
 	c.next = now.Add(5 * time.Minute)
-}
-
-func discoverPublicIPv4() (netip.Addr, error) {
-	transport := &http.Transport{
-		Proxy:       nil,
-		DialContext: (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
-	}
-	defer transport.CloseIdleConnections()
-	// Force IPv4 so a dual-stack host discovers its public IPv4.
-	transport.DialContext = func(ctx context.Context, _, address string) (net.Conn, error) {
-		return (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, "tcp4", address)
-	}
-	client := &http.Client{Transport: transport, Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	return lookupAgreement(client, []string{"https://api4.ipify.org", "https://ipv4.icanhazip.com"})
-}
-
-func lookupAgreement(client *http.Client, endpoints []string) (netip.Addr, error) {
-	var result netip.Addr
-	for _, endpoint := range endpoints {
-		response, err := client.Get(endpoint)
-		if err != nil {
-			return netip.Addr{}, err
-		}
-		body, readErr := io.ReadAll(io.LimitReader(response.Body, 64))
-		response.Body.Close()
-		if readErr != nil || response.StatusCode != http.StatusOK {
-			return netip.Addr{}, fmt.Errorf("public IP endpoint failed")
-		}
-		ip, err := netip.ParseAddr(strings.TrimSpace(string(body)))
-		if err != nil || !ip.Is4() || !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || netip.MustParsePrefix("100.64.0.0/10").Contains(ip) {
-			return netip.Addr{}, fmt.Errorf("public IP endpoint returned an invalid IPv4 address")
-		}
-		if result.IsValid() && result != ip {
-			return netip.Addr{}, fmt.Errorf("public IP endpoints disagree")
-		}
-		result = ip
-	}
-	if !result.IsValid() {
-		return netip.Addr{}, fmt.Errorf("no public IP endpoints")
-	}
-	return result, nil
 }
 
 var _ caddyfile.Unmarshaler = (*Matcher)(nil)
